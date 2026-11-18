@@ -1,0 +1,98 @@
+server:
+  port: 8082
+  shutdown: graceful            # termina requests en curso antes de apagar
+
+spring:
+  application:
+    name: catalog-service
+  threads:
+    virtual:
+      enabled: true             # Tomcat + @Scheduled sobre virtual threads (Java 21)
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:15433/catalog}
+    username: ${DB_USER:catalog}
+    password: ${DB_PASSWORD:catalog}
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 2000  # no esperar 30s por una conexión: fallar rápido
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate        # el esquema lo maneja Flyway, Hibernate sólo valida
+  mvc:
+    problemdetails:
+      enabled: true             # errores con formato RFC 7807
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9094}
+    producer:
+      acks: all                 # durabilidad: esperar a todas las réplicas in-sync
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true  # evita duplicados por reintentos del propio producer
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+    consumer:
+      group-id: catalog-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        isolation.level: read_committed
+    listener:
+      ack-mode: record          # commit del offset tras procesar cada registro OK
+      concurrency: 3
+      observation-enabled: true # tracing a través de Kafka
+    template:
+      observation-enabled: true
+
+# Relay del outbox (ver OutboxRelay)
+outbox:
+  poll-interval-ms: 500
+  batch-size: 50
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,ratelimiters
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: ${OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+
+# ---------------------------------------------------------------------
+# Límite de uso del lado SERVIDOR (load shedding).
+# Aunque el gateway limita por cliente, el provider se protege a sí mismo
+# de picos globales (p. ej. un consumidor interno con un bug de reintentos).
+# timeoutDuration: 0 => si no hay permiso se rechaza al instante con 429.
+# ---------------------------------------------------------------------
+resilience4j:
+  ratelimiter:
+    instances:
+      catalog-api:
+        limit-for-period: ${CATALOG_RATE_LIMIT:200}
+        limit-refresh-period: 1s
+        timeout-duration: 0
+        register-health-indicator: false
+
+logging:
+  level:
+    org.apache.kafka: WARN   # los clientes de Kafka loguean toda su config en INFO
+  pattern:
+    level: "%5p [${spring.application.name},%X{traceId:-},%X{correlationId:-}]"

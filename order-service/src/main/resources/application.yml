@@ -1,0 +1,228 @@
+server:
+  port: 8081
+  shutdown: graceful
+
+spring:
+  application:
+    name: order-service
+  threads:
+    virtual:
+      enabled: true
+  lifecycle:
+    timeout-per-shutdown-phase: 20s
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:15432/orders}
+    username: ${DB_USER:orders}
+    password: ${DB_PASSWORD:orders}
+    hikari:
+      maximum-pool-size: 10
+      connection-timeout: 2000
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+  mvc:
+    problemdetails:
+      enabled: true
+    async:
+      # Techo absoluto para requests async (CompletableFuture). Debe ser > order.quote.total-budget.
+      request-timeout: 5s
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP:localhost:9094}
+    producer:
+      acks: all
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+      properties:
+        enable.idempotence: true
+        delivery.timeout.ms: 10000
+        request.timeout.ms: 5000
+    consumer:
+      group-id: order-service
+      auto-offset-reset: earliest
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      properties:
+        isolation.level: read_committed
+    listener:
+      ack-mode: record
+      concurrency: 3
+      observation-enabled: true
+    template:
+      observation-enabled: true
+
+# ---------------------------------------------------------------------
+# Cliente HTTP hacia catalog-service.
+# Timeouts de transporte SIEMPRE explícitos: el default de muchos clientes es "infinito",
+# y un thread colgado esperando a un servicio lento es el inicio de una falla en cascada.
+# En docker-compose base-url apunta a Toxiproxy, no directo al catálogo.
+# ---------------------------------------------------------------------
+catalog:
+  client:
+    base-url: ${CATALOG_BASE_URL:http://localhost:8082}
+    connect-timeout: 500ms
+    read-timeout: 800ms
+
+order:
+  quote:
+    # Presupuesto TOTAL para cotizar un pedido (todas las llamadas al catálogo, con reintentos).
+    # Por encima de esto se responde 503 aunque queden reintentos: el cliente ya no espera.
+    total-budget: 2500ms
+    # El descuento es un dato OPCIONAL: si no llega en este tiempo se cotiza sin descuento.
+    discount-budget: 400ms
+    # Antigüedad máxima de un precio cacheado para usarlo como fallback.
+    price-cache-ttl: 10m
+
+outbox:
+  poll-interval-ms: 500
+  batch-size: 50
+
+# =====================================================================
+# RESILIENCE4J — política de resiliencia hacia catalog-service.
+#
+# Hay una instancia POR OPERACIÓN (catalog-stock, catalog-price, catalog-discount):
+# si "discount" se degrada, abre SU circuito y agota SU bulkhead sin afectar a "price".
+# Granularidad = radio de explosión de una falla.
+#
+# Orden de composición (ver ResilientExecutor):
+#   Retry( CircuitBreaker( RateLimiter( TimeLimiter( Bulkhead( llamada HTTP ) ) ) ) )
+# =====================================================================
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        sliding-window-type: COUNT_BASED
+        sliding-window-size: 10                  # evalúa las últimas 10 llamadas
+        minimum-number-of-calls: 5               # no opina con menos de 5 muestras
+        failure-rate-threshold: 50               # >=50% de fallas => OPEN
+        slow-call-duration-threshold: 600ms      # una llamada "lenta" también es síntoma
+        slow-call-rate-threshold: 80             # >=80% lentas => OPEN
+        wait-duration-in-open-state: 10s         # tiempo en OPEN antes de probar
+        permitted-number-of-calls-in-half-open-state: 3
+        automatic-transition-from-open-to-half-open-enabled: true
+        register-health-indicator: true
+        # Un circuito abierto es una DEGRADACIÓN esperada, no una caída del servicio:
+        # no queremos que el orquestador reinicie order-service por eso.
+        allow-health-indicator-to-fail: false
+        # Sólo fallas de INFRAESTRUCTURA abren el circuito. Un 404 es una respuesta válida.
+        record-exceptions:
+          - com.matty.integration.order.client.CatalogUnavailableException
+          - java.util.concurrent.TimeoutException
+          - io.github.resilience4j.bulkhead.BulkheadFullException
+        ignore-exceptions:
+          - com.matty.integration.order.client.UnknownProductException
+          - io.github.resilience4j.ratelimiter.RequestNotPermitted
+    instances:
+      catalog-stock:
+        base-config: default
+      catalog-price:
+        base-config: default
+      catalog-discount:
+        base-config: default
+
+  retry:
+    configs:
+      default:
+        max-attempts: 3                          # 1 intento + 2 reintentos
+        wait-duration: 100ms
+        enable-exponential-backoff: true         # 100ms, 200ms, ...
+        exponential-backoff-multiplier: 2
+        enable-randomized-wait: true             # jitter: evita que N clientes reintenten sincronizados
+        randomized-wait-factor: 0.5
+        # Sólo se reintenta lo TRANSITORIO. Nunca: 4xx, circuito abierto, rate limit, bulkhead lleno
+        # (reintentar contra un sistema saturado lo satura más => "retry storm").
+        retry-exceptions:
+          - com.matty.integration.order.client.CatalogUnavailableException
+          - java.util.concurrent.TimeoutException
+        ignore-exceptions:
+          - com.matty.integration.order.client.UnknownProductException
+          - io.github.resilience4j.circuitbreaker.CallNotPermittedException
+          - io.github.resilience4j.ratelimiter.RequestNotPermitted
+          - io.github.resilience4j.bulkhead.BulkheadFullException
+    instances:
+      catalog-stock:
+        base-config: default
+      catalog-price:
+        base-config: default
+      catalog-discount:
+        base-config: default
+        max-attempts: 1                          # dato opcional: no vale la pena reintentar
+
+  timelimiter:
+    configs:
+      default:
+        timeout-duration: 1s                     # incluye espera en la cola del bulkhead + HTTP
+        cancel-running-future: true
+    instances:
+      catalog-stock:
+        base-config: default
+      catalog-price:
+        base-config: default
+      catalog-discount:
+        base-config: default
+
+  # BULKHEAD: pool de threads dedicado por operación. Limita la concurrencia hacia el
+  # catálogo y aísla: un endpoint lento sólo puede consumir SUS threads.
+  thread-pool-bulkhead:
+    configs:
+      default:
+        core-thread-pool-size: 8
+        max-thread-pool-size: 16
+        queue-capacity: 20
+        keep-alive-duration: 20ms
+    instances:
+      catalog-stock:
+        base-config: default
+      catalog-price:
+        base-config: default
+      catalog-discount:
+        base-config: default
+
+  # RATE LIMITER del CLIENTE: somos buenos ciudadanos y no le mandamos al catálogo
+  # más de lo acordado (el catálogo además se protege con su propio límite).
+  ratelimiter:
+    configs:
+      default:
+        limit-for-period: 100
+        limit-refresh-period: 1s
+        timeout-duration: 50ms                   # espera breve por un permiso, luego falla
+    instances:
+      catalog-stock:
+        base-config: default
+      catalog-price:
+        base-config: default
+      catalog-discount:
+        base-config: default
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,circuitbreakers,circuitbreakerevents,retries,ratelimiters,bulkheads
+  endpoint:
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  health:
+    circuitbreakers:
+      enabled: true
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: ${OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+        http.client.requests: true
+
+logging:
+  level:
+    org.apache.kafka: WARN   # los clientes de Kafka loguean toda su config en INFO
+  pattern:
+    level: "%5p [${spring.application.name},%X{traceId:-},%X{correlationId:-}]"

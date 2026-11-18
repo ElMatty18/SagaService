@@ -1,0 +1,61 @@
+server:
+  port: 8080
+  shutdown: graceful
+
+spring:
+  application:
+    name: api-gateway
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:16379}
+      timeout: 500ms            # si Redis tarda, no frenar todo el tráfico (rate limit fail-open)
+  cloud:
+    gateway:
+      server:
+        webflux:
+          httpclient:
+            connect-timeout: 1000   # ms
+            response-timeout: 5s    # techo duro hacia los backends
+
+gateway:
+  routes:
+    order-service-url: ${ORDER_SERVICE_URL:http://localhost:8081}
+    catalog-service-url: ${CATALOG_SERVICE_URL:http://localhost:8082}
+  # Demo: en producción las keys vendrían de un store seguro (hasheadas), nunca en un yml.
+  api-keys:
+    demo-free-key: FREE
+    demo-premium-key: PREMIUM
+  plans:
+    FREE:
+      replenish-rate: 2       # 2 req/s sostenido
+      burst-capacity: 5       # ráfaga máxima de 5
+    PREMIUM:
+      replenish-rate: 20
+      burst-capacity: 40
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics,gateway,circuitbreakers
+  endpoint:
+    gateway:
+      access: read-only
+    health:
+      show-details: always
+      probes:
+        enabled: true
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: ${OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+  metrics:
+    tags:
+      application: ${spring.application.name}
+
+logging:
+  pattern:
+    level: "%5p [${spring.application.name},%X{traceId:-},%X{correlationId:-}]"
